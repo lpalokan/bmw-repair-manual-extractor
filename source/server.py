@@ -66,21 +66,28 @@ def create_app() -> 'Flask':
 
     # ── model detail ──────────────────────────────────────────────────────────
 
+    # Cache: model code → list of procedure dicts (avoids re-reading 236 blobs)
+    _proc_cache: dict[str, list] = {}
+
     @app.route('/model/<code>')
     def model_detail(code):
         model_info = get_model_info(config.DECODED_DB, code)
+
+        if code not in _proc_cache:
+            _proc_cache[code] = _build_procedure_list(code)
+
+        return render_template('model.html', model=model_info,
+                               procedures=_proc_cache[code])
+
+    def _build_procedure_list(code: str) -> list[dict]:
+        """Read all POS-subdir paths for a model, extract real titles from XML."""
+        _SUFFIX_LABELS = {
+            '_AD': 'Technical data', '_BS': 'Safety', '_SW': 'Tools',
+            '_TD': 'Torque', '_WAU': 'Notes', '_REPSCH': 'Diagram',
+        }
+
         reader = GdbReader(config.DECODED_DB)
         all_paths = reader.list_paths(code, config.DEFAULT_SUBDIR)
-        reader.close()
-
-        # Build a map: procedure_key → {name, main_path, sub_docs}
-        # Only one entry per logical procedure (keyed on the numeric ID + name).
-        # The _POS.XML variant is the main document; others are sub-documents.
-        _SUFFIXES = ('_POS', '_AD', '_BS', '_SW', '_TD', '_WAU', '_REPSCH')
-        _SUFFIX_LABELS = {
-            '_POS': 'Steps', '_AD': 'Technical data', '_BS': 'Safety',
-            '_SW': 'Tools', '_TD': 'Torque', '_WAU': 'Notes', '_REPSCH': 'Diagram',
-        }
 
         proc_map: dict[str, dict] = {}
         for p in all_paths:
@@ -90,29 +97,30 @@ def create_app() -> 'Flask':
             )
             if not m:
                 continue
-            key   = m.group(1)   # e.g. "1111_0458_01_1111120_ALLE_ZYLINDER_KOLBEN_ERS"
-            name_raw = m.group(2)  # e.g. "ALLE_ZYLINDER_KOLBEN_ERS"
-            suffix = m.group(3).upper()  # e.g. "_POS"
+            key      = m.group(1)
+            name_raw = m.group(2)
+            suffix   = m.group(3).upper()
 
             if key not in proc_map:
                 proc_map[key] = {
-                    'name': name_raw.replace('_', ' ').title(),
+                    'name': name_raw.replace('_', ' ').title(),  # fallback
                     'main_path': None,
                     'sub_docs': [],
                 }
+
             if suffix == '_POS':
                 proc_map[key]['main_path'] = p
+                # Extract real title from the XML blob (fast — no XSLT)
+                xml = reader.get_xml_exact(p) or ''
+                tm = re.search(r'<EMPH[^>]*BOLD="1"[^>]*>([^<]+)', xml)
+                if tm:
+                    proc_map[key]['name'] = tm.group(1).strip()
             else:
                 label = _SUFFIX_LABELS.get(suffix, suffix.lstrip('_'))
                 proc_map[key]['sub_docs'].append({'label': label, 'db_path': p})
 
-        # Sort by key (which starts with the section number) and emit only
-        # procedures that have a main POS document.
-        procedures = [
-            v for v in proc_map.values() if v['main_path']
-        ]
-
-        return render_template('model.html', model=model_info, procedures=procedures)
+        reader.close()
+        return [v for v in proc_map.values() if v['main_path']]
 
     # ── procedure renderer ────────────────────────────────────────────────────
 

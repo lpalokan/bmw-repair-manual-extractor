@@ -42,8 +42,17 @@ def _proc_slug(db_path: str) -> str:
     return re.sub(r'\.XML$', '', basename, flags=re.IGNORECASE)
 
 
-def _proc_display_name(db_path: str) -> str:
-    """Human-readable procedure name from DB path."""
+def _proc_display_name(db_path: str, xml: str | None = None) -> str:
+    """Human-readable procedure name.
+
+    Prefers the real title from the XML (<EMPH BOLD="1">); falls back to the
+    path-derived German name if the XML is unavailable or has no such element.
+    """
+    if xml:
+        m = re.search(r'<EMPH[^>]*BOLD="1"[^>]*>([^<]+)', xml)
+        if m:
+            return m.group(1).strip()
+    # Fallback: derive from path
     basename = db_path.replace('\\', '/').rsplit('/', 1)[-1]
     m = re.search(r'\d{4}_\d{2}_\d+_(.+)_(?:POS|AD|BS|SW|TD|WAU|REPSCH)\.XML$',
                   basename, re.IGNORECASE)
@@ -137,6 +146,7 @@ def export_model_html(
         if not xml:
             continue
 
+        name = _proc_display_name(db_path, xml)  # use real title now we have the XML
         html = xml_to_html(xml, xsl_path, data_parent)
         html, _ = _collect_and_copy_images(html, images_dir)
         html = _inject_css(html, _SCREEN_CSS)
