@@ -29,6 +29,7 @@ import config
 from gdb_reader import GdbReader, decode_db
 from model_registry import list_models, get_model_info
 from pdf_builder import merge_pdfs, make_title_page_html, html_to_pdf
+from html_exporter import export_model_html
 
 # Batch size for subprocess rendering: keeps each worker process small enough
 # to avoid the WeasyPrint/Pango/fontconfig crash on macOS ARM64.
@@ -164,6 +165,83 @@ def cmd_extract(model, out, subdir, limit):
     click.echo(f'Done. {page_count} pages, {size_mb:.1f} MB')
     if fail_count:
         click.echo(f'({fail_count} procedures failed to render)', err=True)
+
+
+@cli.command('export-html')
+@click.option('--model', required=True, help='4-digit model code (e.g. 0458). Run "models" to see all codes.')
+@click.option('--out', default=None, help=f'Output directory (default: output/<model_name>_<code>/)')
+@click.option('--subdir', default=config.DEFAULT_SUBDIR, show_default=True,
+              help='DB subdirectory to render (POS = main repair steps)')
+@click.option('--limit', default=0, help='Max procedures to export (0 = all; use small values for testing)')
+def cmd_export_html(model, out, subdir, limit):
+    """Export all repair procedures for a model as a self-contained HTML directory.
+
+    The output directory contains an index.html listing all procedures, plus
+    a procedures/ folder with one HTML file per procedure, and an images/
+    folder with all referenced images copied locally.
+
+    \b
+    Examples:
+      python main.py export-html --model 0458
+      python main.py export-html --model 0458 --out ~/Desktop/HP2_Sport/
+      python main.py export-html --model 0458 --limit 5   # quick test
+    """
+    _ensure_db()
+
+    model_info = get_model_info(config.DECODED_DB, model)
+    click.echo(f'Model {model}: {model_info.name}')
+
+    reader = GdbReader(config.DECODED_DB)
+    paths = reader.list_paths(model, subdir)
+    reader.close()
+    if limit:
+        paths = paths[:limit]
+    click.echo(f'Found {len(paths)} records in {subdir}')
+
+    if out is None:
+        safe_name = model_info.name.replace(' ', '_').replace('/', '-')
+        out = os.path.join(config.OUTPUT_DIR, f'BMW_{safe_name}_{model}')
+    os.makedirs(out, exist_ok=True)
+
+    data_parent = os.path.dirname(config.DATA_DIR)
+    total = len(paths)
+
+    def _progress(current, total_, slug):
+        click.echo(f'  [{current}/{total_}] {slug}')
+
+    export_model_html(
+        model_info=model_info,
+        paths=paths,
+        out_dir=out,
+        xsl_path=config.XSL_PATH,
+        data_parent=data_parent,
+        on_progress=_progress,
+    )
+
+    click.echo(f'\nDone. {total} procedures → {out}')
+    click.echo(f'Open: file://{os.path.join(out, "index.html")}')
+
+
+@cli.command('serve')
+@click.option('--port', default=5000, show_default=True, help='Port to listen on')
+@click.option('--host', default='127.0.0.1', show_default=True, help='Host to bind')
+@click.option('--debug', is_flag=True, default=False, help='Enable Flask debug mode')
+def cmd_serve(port, host, debug):
+    """Start a local web server for browsing all models and repair procedures.
+
+    Renders procedures on demand — no pre-rendering required.
+
+    \b
+    Examples:
+      python main.py serve
+      python main.py serve --port 8080
+    """
+    _ensure_db()
+    from server import create_app
+    app = create_app()
+    click.echo(f'Starting BMW Repair Manual server at http://{host}:{port}/')
+    click.echo('Press Ctrl+C to stop.')
+    app.run(host=host, port=port, debug=debug)
 
 
 def _run_worker_batch(worker: str, batch: list[str], tmp_dir: str) -> tuple[set[str], list[str]]:
