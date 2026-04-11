@@ -27,24 +27,16 @@ def _rewrite_image_urls(html: str) -> str:
     Replace file:// image URLs produced by render.xml_to_html with Flask
     /image/<rel_path> routes.
 
-    render.py produces:  src="file:///path/to/DATAS/BMW-Motorrad/BILD/foo.jpg"
-    We emit:             src="/image/BMW-Motorrad/BILD/foo.jpg"
+    render.py produces URLs like:
+      src="file:///Users/.../BMW%20Repair%20manual%20application/DATAS/BMW-Motorrad/BILD/foo.jpg"
+
+    The base path contains %20-encoded spaces, so we anchor on the stable
+    'BMW-Motorrad/' segment instead of trying to match the full base path.
+
+    We emit: src="/image/BMW-Motorrad/BILD/foo.jpg"
     """
-    data_parent = os.path.dirname(config.DATA_DIR)  # …/DATAS
-    # Normalise to forward slashes for the regex (macOS paths have no spaces
-    # in the DATAS tree, but URL-encode any that do)
-    base_url = 'file://' + data_parent.replace('\\', '/')
-
-    def _replace(m: re.Match) -> str:
-        attr = m.group(1)   # 'src=' or 'href='
-        url  = m.group(2)   # full file:// URL
-        # Strip the base, keep the relative portion (BMW-Motorrad/...)
-        rel = url.removeprefix(base_url).lstrip('/')
-        return f'{attr}"/image/{rel}"'
-
-    escaped_base = re.escape(base_url)
     return re.sub(
-        rf'(src=|href=)"{escaped_base}/([^"]+\.(jpg|gif|png|JPG|GIF|PNG))"',
+        r'(src=|href=)"file://[^"]*/(BMW-Motorrad[^"]+\.(jpg|gif|png|JPG|GIF|PNG))"',
         lambda m: f'{m.group(1)}"/image/{m.group(2)}"',
         html,
     )
@@ -78,17 +70,47 @@ def create_app() -> 'Flask':
     def model_detail(code):
         model_info = get_model_info(config.DECODED_DB, code)
         reader = GdbReader(config.DECODED_DB)
-        paths = reader.list_paths(code, config.DEFAULT_SUBDIR)
+        all_paths = reader.list_paths(code, config.DEFAULT_SUBDIR)
         reader.close()
 
-        procedures = []
-        for p in paths:
+        # Build a map: procedure_key → {name, main_path, sub_docs}
+        # Only one entry per logical procedure (keyed on the numeric ID + name).
+        # The _POS.XML variant is the main document; others are sub-documents.
+        _SUFFIXES = ('_POS', '_AD', '_BS', '_SW', '_TD', '_WAU', '_REPSCH')
+        _SUFFIX_LABELS = {
+            '_POS': 'Steps', '_AD': 'Technical data', '_BS': 'Safety',
+            '_SW': 'Tools', '_TD': 'Torque', '_WAU': 'Notes', '_REPSCH': 'Diagram',
+        }
+
+        proc_map: dict[str, dict] = {}
+        for p in all_paths:
             m = re.search(
-                r'\d{4}_\d{2}_\d+_(.+)_(?:POS|AD|BS|SW|TD|WAU|REPSCH)\.XML$',
+                r'(\d{4}_\d{2}_\d+_(.+))(_(?:POS|AD|BS|SW|TD|WAU|REPSCH))\.XML$',
                 p, re.IGNORECASE
             )
-            name = m.group(1).replace('_', ' ').title() if m else p
-            procedures.append({'name': name, 'db_path': p})
+            if not m:
+                continue
+            key   = m.group(1)   # e.g. "1111_0458_01_1111120_ALLE_ZYLINDER_KOLBEN_ERS"
+            name_raw = m.group(2)  # e.g. "ALLE_ZYLINDER_KOLBEN_ERS"
+            suffix = m.group(3).upper()  # e.g. "_POS"
+
+            if key not in proc_map:
+                proc_map[key] = {
+                    'name': name_raw.replace('_', ' ').title(),
+                    'main_path': None,
+                    'sub_docs': [],
+                }
+            if suffix == '_POS':
+                proc_map[key]['main_path'] = p
+            else:
+                label = _SUFFIX_LABELS.get(suffix, suffix.lstrip('_'))
+                proc_map[key]['sub_docs'].append({'label': label, 'db_path': p})
+
+        # Sort by key (which starts with the section number) and emit only
+        # procedures that have a main POS document.
+        procedures = [
+            v for v in proc_map.values() if v['main_path']
+        ]
 
         return render_template('model.html', model=model_info, procedures=procedures)
 

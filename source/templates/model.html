@@ -15,12 +15,19 @@
                    border: 1px solid #ddd; border-radius: 4px; padding: 4px; }
     h1 { color: #003399; margin: 0 0 4px; }
     .subtitle { color: #666; margin: 0; font-size: 11pt; }
-    ul { list-style: none; padding: 0; background: #fff;
-          border: 1px solid #ddd; border-radius: 6px; overflow: hidden; }
-    li a { display: block; padding: 9px 14px; border-bottom: 1px solid #eee;
-            text-decoration: none; color: #222; font-size: 10pt; }
-    li:last-child a { border-bottom: none; }
-    li a:hover { background: #f0f4ff; color: #003399; }
+    .proc-list { list-style: none; padding: 0; margin: 0; }
+    .proc-item { background: #fff; border: 1px solid #ddd; border-radius: 5px;
+                  margin-bottom: 6px; overflow: hidden; }
+    .proc-main { display: block; padding: 10px 14px; text-decoration: none;
+                  color: #111; font-size: 10pt; font-weight: 500; }
+    .proc-main:hover { background: #f0f4ff; color: #003399; }
+    .proc-sub { display: flex; flex-wrap: wrap; gap: 4px;
+                 padding: 0 14px 8px; border-top: 1px solid #f0f0f0; }
+    .proc-sub a { font-size: 9pt; color: #555; text-decoration: none;
+                   background: #f4f4f4; border: 1px solid #ddd;
+                   border-radius: 3px; padding: 2px 8px; }
+    .proc-sub a:hover { background: #e8eeff; color: #003399; border-color: #aac; }
+    .note { font-size: 9pt; color: #999; margin-top: 2px; }
   </style>
 </head>
 <body>
@@ -34,13 +41,23 @@
     <div>
       <h1>{{ model.name }}</h1>
       <p class="subtitle">Model {{ model.code }} &mdash; {{ procedures|length }} repair procedures</p>
+      <p class="note">Procedure names are in German (original BMW manual language)</p>
     </div>
   </div>
 
-  <ul>
+  <ul class="proc-list">
     {% for proc in procedures %}
-    <li>
-      <a href="/procedure/{{ model.code }}/{{ proc.db_path }}">{{ proc.name }}</a>
+    <li class="proc-item">
+      <a class="proc-main" href="/procedure/{{ model.code }}/{{ proc.main_path }}">
+        {{ proc.name }}
+      </a>
+      {% if proc.sub_docs %}
+      <div class="proc-sub">
+        {% for doc in proc.sub_docs %}
+        <a href="/procedure/{{ model.code }}/{{ doc.db_path }}">{{ doc.label }}</a>
+        {% endfor %}
+      </div>
+      {% endif %}
     </li>
     {% endfor %}
   </ul>
