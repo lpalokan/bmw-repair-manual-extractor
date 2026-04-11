@@ -1,0 +1,4 @@
+lxml>=5.0
+weasyprint>=60.0
+pypdf>=4.0
+click>=8.0
