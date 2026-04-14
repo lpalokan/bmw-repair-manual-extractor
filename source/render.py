@@ -74,6 +74,8 @@ def xml_to_html(xml_str: str, xsl_path: str, data_dir: str) -> str:
 def strip_pdf_hrefs(html: str) -> str:
     """Remove non-file hrefs that are meaningless or broken in a merged PDF.
 
+    Used for the *short* PDF export where linked documents are not rendered.
+
     The XSLT produces three kinds of non-image hrefs:
       - href="link::BMW-Motorrad/..."  cross-procedure links (target not a PDF page)
       - href="javascript:void(null)"   Windows-app expand/collapse callbacks
@@ -90,9 +92,47 @@ def strip_pdf_hrefs(html: str) -> str:
         flags=re.S | re.I,
     )
     # Same-page #anchors — just drop the href attribute, keep the <a> tag
+    html = re.sub(r'\bhref="#[^"]*"', '', html)
+    return html
+
+
+def sentinel_pdf_hrefs(html: str) -> str:
+    """Replace link:: hrefs with bmwlink://SLUG sentinels for GoTo patching.
+
+    Used for the *long* PDF export where all linked documents are rendered.
+    WeasyPrint turns these into PDF URI actions; after merging, patch_goto_links()
+    replaces the bmwlink:// URIs with actual GoTo page-number actions.
+
+    javascript: and #anchor hrefs are still stripped as they have no PDF target.
+    """
+    def _replace(m: re.Match) -> str:
+        link_path = m.group(1)   # BMW-Motorrad/AUS/1111_0458_01_foo_AUS.xml
+        basename = link_path.rsplit('/', 1)[-1]
+        slug = re.sub(r'\.xml$', '', basename, flags=re.IGNORECASE).upper()
+        return f'href="bmwlink://{slug}"'
+
     html = re.sub(
-        r'\bhref="#[^"]*"',
-        '',
+        r'href="link::(BMW-Motorrad[^"]+)"',
+        _replace,
         html,
     )
+    # javascript: hrefs — strip the <a> to a <span>
+    html = re.sub(
+        r'<a\b([^>]*)\bhref="javascript:[^"]*"([^>]*)>(.*?)</a>',
+        r'<span\1\2>\3</span>',
+        html,
+        flags=re.S | re.I,
+    )
+    # Same-page #anchors — drop the href attribute
+    html = re.sub(r'\bhref="#[^"]*"', '', html)
     return html
+
+
+def extract_ref_links(xml: str) -> list[str]:
+    """Return all cross-document REF LINK paths from a raw XML blob.
+
+    These are <REF LINK="BMW-Motorrad/..."> elements that the XSLT renders
+    as link:: hrefs.  Image paths (jpg/gif/png) are excluded.
+    """
+    refs = re.findall(r'<REF\b[^>]*\bLINK="(BMW-Motorrad[^"]+)"', xml, re.I)
+    return [r for r in refs if not re.search(r'\.(jpg|gif|png)$', r, re.I)]

@@ -30,6 +30,7 @@ import config
 from gdb_reader import GdbReader, decode_db
 from model_registry import list_models, get_model_info
 from pdf_builder import build_final_pdf, make_title_page_html, html_to_pdf
+from render import extract_ref_links
 from html_exporter import export_model_html
 
 # Batch size for subprocess rendering: keeps each worker process small enough
@@ -89,15 +90,24 @@ def cmd_list_paths(model, subdir):
 @click.option('--subdir', default=config.DEFAULT_SUBDIR, show_default=True,
               help='DB subdirectory to render (POS = main repair steps)')
 @click.option('--limit', default=0, help='Max procedures to render (0 = all; use small values for testing)')
-def cmd_extract(model, out, subdir, limit):
+@click.option('--full', 'full_pdf', is_flag=True, default=False,
+              help='Long PDF: render all cross-referenced documents (AUS/EIN/SPEZW/…) '
+                   'and wire up internal links as clickable GoTo annotations. '
+                   'Produces a complete but larger PDF (~3× page count).')
+def cmd_extract(model, out, subdir, limit, full_pdf):
     """Extract all repair procedures for a model and produce a merged PDF.
 
-    The output PDF contains a title page followed by all procedure pages,
-    one procedure per page, in alphabetical order by procedure name.
+    Without --full (short PDF): renders main procedures and their tightening
+    torques, special tools, lubricants etc.  Cross-procedure links are removed.
+
+    With --full (long PDF): also renders all cross-referenced documents
+    (removal/installation sub-steps, special work, inspections, …) and wires
+    every internal link as a clickable GoTo page annotation.
 
     \b
     Examples:
-      python main.py extract --model 0458
+      python main.py extract --model 0458              # short PDF
+      python main.py extract --model 0458 --full       # long PDF with live links
       python main.py extract --model 0507 --out ~/Desktop/
       python main.py extract --model 0458 --limit 10   # quick test
     """
@@ -130,6 +140,7 @@ def cmd_extract(model, out, subdir, limit):
     # on macOS ARM64 (FcConfigDestroy SIGSEGV when GC finalizes font objects
     # while Pango font worker threads are still running).
     worker = os.path.join(os.path.dirname(__file__), 'render_worker.py')
+    worker_flags = ['--full'] if full_pdf else []
     fail_count = 0
     total = len(paths)
 
@@ -141,14 +152,16 @@ def cmd_extract(model, out, subdir, limit):
         batch_end = batch_start + len(batch)
         click.echo(f'  Rendering [{batch_start+1}–{batch_end}/{total}] in subprocess...')
 
-        confirmed, new_pairs = _run_worker_batch(worker, batch, tmp_dir)
+        confirmed, new_pairs = _run_worker_batch(worker, batch, tmp_dir,
+                                                  extra_flags=worker_flags)
         all_proc_pairs.extend(new_pairs)
 
         if len(confirmed) < len(batch):
             missing = [p for p in batch if p not in confirmed]
             click.echo(f'  Worker crashed (SIGSEGV); retrying {len(missing)} path(s) one-by-one...', err=True)
             for path in missing:
-                _, retry_pairs = _run_worker_batch(worker, [path], tmp_dir)
+                _, retry_pairs = _run_worker_batch(worker, [path], tmp_dir,
+                                                    extra_flags=worker_flags)
                 all_proc_pairs.extend(retry_pairs)
                 if retry_pairs:
                     click.echo(f'    RETRY OK: {os.path.basename(path)}')
@@ -156,8 +169,65 @@ def cmd_extract(model, out, subdir, limit):
                     fail_count += 1
                     click.echo(f'    RETRY FAIL: {path}', err=True)
 
+    # ── BFS: render linked documents (long PDF only) ──────────────────────────
+    linked_pairs: list[tuple[str, str]] = []   # (slug, pdf_path)
+    if full_pdf:
+        click.echo('\nCollecting cross-document links (BFS)...')
+        reader_bfs = GdbReader(config.DECODED_DB)
+        rendered_upper = set(p.upper() for p, _ in all_proc_pairs)
+        pending: list[str] = []
+
+        for db_path, _ in all_proc_pairs:
+            xml = reader_bfs.get_xml_exact(db_path) or ''
+            for ref in extract_ref_links(xml):
+                norm = ref.replace('/', '\\').upper()
+                if norm not in rendered_upper:
+                    pending.append(norm)
+                    rendered_upper.add(norm)
+
+        wave = 0
+        while pending:
+            wave += 1
+            click.echo(f'  BFS wave {wave}: {len(pending)} documents...')
+            batch_total = len(pending)
+            wave_pairs: list[tuple[str, str]] = []
+
+            for batch_start in range(0, batch_total, _BATCH_SIZE):
+                batch = pending[batch_start:batch_start + _BATCH_SIZE]
+                batch_end = batch_start + len(batch)
+                click.echo(f'    [{batch_start+1}–{batch_end}/{batch_total}]')
+                confirmed, new_pairs = _run_worker_batch(
+                    worker, batch, tmp_dir, extra_flags=worker_flags)
+                wave_pairs.extend(new_pairs)
+
+                if len(confirmed) < len(batch):
+                    missing = [p for p in batch if p not in confirmed]
+                    for path in missing:
+                        _, retry_pairs = _run_worker_batch(
+                            worker, [path], tmp_dir, extra_flags=worker_flags)
+                        wave_pairs.extend(retry_pairs)
+                        if not retry_pairs:
+                            fail_count += 1
+
+            next_pending: list[str] = []
+            for db_path, pdf_path in wave_pairs:
+                basename = db_path.replace('\\', '/').rsplit('/', 1)[-1]
+                slug = re.sub(r'\.XML$', '', basename, flags=re.IGNORECASE).upper()
+                linked_pairs.append((slug, pdf_path))
+                xml = reader_bfs.get_xml_exact(db_path) or ''
+                for ref in extract_ref_links(xml):
+                    norm = ref.replace('/', '\\').upper()
+                    if norm not in rendered_upper:
+                        next_pending.append(norm)
+                        rendered_upper.add(norm)
+
+            pending = next_pending
+
+        reader_bfs.close()
+        click.echo(f'  BFS complete: {len(linked_pairs)} linked documents rendered.')
+
     # ── Look up English titles for TOC ────────────────────────────────────────
-    click.echo(f'\nLooking up procedure titles for table of contents...')
+    click.echo('\nLooking up procedure titles for table of contents...')
     reader = GdbReader(config.DECODED_DB)
     toc_proc_pairs: list[tuple[str, str, bool]] = []  # (title, pdf_path, is_main)
     for db_path, pdf_path in all_proc_pairs:
@@ -169,28 +239,26 @@ def cmd_extract(model, out, subdir, limit):
         if m:
             title = m.group(1).replace('\xa0', ' ').strip()
             if not is_main:
-                # Strip leading "NN NN NNN " procedure-number prefix from sub-docs
-                # so "11 11 120 Tightening Torques" → "Tightening Torques"
                 title = re.sub(r'^\d[\d\s]{3,10}\s+', '', title).strip()
-                # Strip trailing " NNNN - ModelName" model suffix
-                # so "Tightening torques 0458 - HP2 Sport" → "Tightening torques"
                 title = re.sub(r'\s+\d{4}\s*[-\u2013].*$', '', title).strip()
         else:
-            # Fallback: derive from path
             nm = re.search(r'\d{4}_\d{2}_\d+_(.+?)_(\w+)\.XML$', basename, re.IGNORECASE)
-            if nm:
-                title = nm.group(1).replace('_', ' ').title()
-            else:
-                title = re.sub(r'\.XML$', '', basename, flags=re.IGNORECASE)
+            title = nm.group(1).replace('_', ' ').title() if nm else re.sub(
+                r'\.XML$', '', basename, flags=re.IGNORECASE)
 
         toc_proc_pairs.append((title, pdf_path, is_main))
     reader.close()
 
-    # ── Build final PDF with TOC, bookmarks and clickable links ───────────────
+    # ── Build final PDF with TOC, bookmarks and (optionally) live links ───────
     safe_name = model_info.name.replace(' ', '_').replace('/', '-')
-    merged_path = os.path.join(out_dir, f'BMW_{safe_name}_{model}_Repair_Manual.pdf')
-    click.echo(f'Building final PDF with table of contents → {merged_path}')
-    build_final_pdf(title_pdf, toc_proc_pairs, merged_path)
+    suffix = '_Full' if full_pdf else ''
+    merged_path = os.path.join(out_dir, f'BMW_{safe_name}_{model}_Repair_Manual{suffix}.pdf')
+    click.echo(f'Building final PDF → {merged_path}')
+    build_final_pdf(
+        title_pdf, toc_proc_pairs, merged_path,
+        linked_pdfs=linked_pairs if full_pdf else None,
+        slug_to_page=None,
+    )
 
     import pypdf
     page_count = len(pypdf.PdfReader(merged_path).pages)
@@ -278,7 +346,8 @@ def cmd_serve(port, host, debug):
 
 
 def _run_worker_batch(
-    worker: str, batch: list[str], tmp_dir: str
+    worker: str, batch: list[str], tmp_dir: str,
+    extra_flags: list[str] | None = None,
 ) -> tuple[set[str], list[tuple[str, str]]]:
     """Run render_worker.py for a batch of DB paths.
 
@@ -291,7 +360,8 @@ def _run_worker_batch(
     proc = subprocess.Popen(
         [sys.executable, worker,
          config.DECODED_DB, config.XSL_PATH,
-         os.path.dirname(config.DATA_DIR), tmp_dir],
+         os.path.dirname(config.DATA_DIR), tmp_dir]
+        + (extra_flags or []),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

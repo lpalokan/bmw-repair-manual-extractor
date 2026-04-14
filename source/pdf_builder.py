@@ -5,11 +5,13 @@ HTML → PDF generator and merger.
 import logging
 import math
 import os
+import re
 import tempfile
 import warnings
 from datetime import date
 
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import ArrayObject, DictionaryObject, NameObject
 from weasyprint import HTML, CSS
 
 # Suppress pypdf annotation merge warnings (harmless cross-doc link issues)
@@ -218,14 +220,22 @@ def build_final_pdf(
     title_pdf: str,
     proc_pairs: list[tuple[str, str, bool]],
     out_path: str,
+    linked_pdfs: list[tuple[str, str]] | None = None,
+    slug_to_page: dict[str, int] | None = None,
 ) -> None:
     """Build the final merged PDF with title page, TOC, procedures, bookmarks and links.
 
     Args:
-        title_pdf:   Path to the already-rendered title-page PDF.
-        proc_pairs:  Ordered list of (title, pdf_path, is_main) where is_main=True
-                     for main POS procedures and False for sub-documents.
-        out_path:    Destination path for the merged PDF.
+        title_pdf:    Path to the already-rendered title-page PDF.
+        proc_pairs:   Ordered list of (title, pdf_path, is_main) where is_main=True
+                      for main POS procedures and False for sub-documents.
+        out_path:     Destination path for the merged PDF.
+        linked_pdfs:  Optional list of (slug, pdf_path) for BFS-rendered linked
+                      documents (long PDF only).  These are appended after the
+                      main procedures without TOC entries.
+        slug_to_page: Optional pre-computed mapping of SLUG → 0-based page index
+                      in the final merged PDF, used by patch_goto_links().
+                      Computed here if not supplied (only needed for long PDF).
     """
     from pypdf.annotations import Link
 
@@ -283,7 +293,7 @@ def build_final_pdf(
         display_nums = _display_pages(offsets)
         actual_toc_pages = _render_toc(proc_titles, display_nums, proc_is_main, toc_pdf_path)
 
-    # ── 4. Merge: title + TOC + procedures ───────────────────────────────────
+    # ── 4. Merge: title + TOC + procedures (+ linked docs for long PDF) ──────
     writer = PdfWriter()
 
     if n_title_pages:
@@ -300,6 +310,14 @@ def build_final_pdf(
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')
                 writer.append(pdf_path)
+
+    # Append linked documents (long PDF only) — no TOC entries, just reachable pages
+    if linked_pdfs:
+        for _slug, pdf_path in linked_pdfs:
+            if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    writer.append(pdf_path)
 
     # ── 5. Sidebar bookmarks (outline) ───────────────────────────────────────
     # Main procedures get top-level bookmarks; sub-docs (AD, SW, BS…) are
@@ -325,7 +343,43 @@ def build_final_pdf(
         )
         writer.add_annotation(page_number=abs_page, annotation=annotation)
 
-    # ── 7. Write output ───────────────────────────────────────────────────────
+    # ── 7. Patch bmwlink:// sentinels → GoTo page actions (long PDF only) ────
+    if linked_pdfs:
+        # Build slug → 0-based page index map from proc_pdfs + linked_pdfs
+        if slug_to_page is None:
+            # _slug_from_pdf: strips the 'BMW-MOTORRAD_<SUBDIR>_' directory
+            # prefix that render_worker adds when building the safe filename,
+            # leaving just the basename portion that sentinel_pdf_hrefs uses.
+            _SUBDIR_PAT = re.compile(
+                r'BMW-MOTORRAD_(?:POS|AUS|EIN|TEILAUS|TEILEIN|SPEZW|WSATZ|'
+                r'PRUE|EINST|FUELL|BS|WAU|REPSCH|GRUPPE-BS|REIN|INB|MES|'
+                r'ZERL|ZUBAU|LEER|TD|SW|AD)_', re.IGNORECASE)
+
+            def _slug_from_pdf(pdf_path: str) -> str:
+                stem = re.sub(r'\.pdf$', '', os.path.basename(pdf_path),
+                              flags=re.IGNORECASE)
+                m = _SUBDIR_PAT.search(stem)
+                raw = stem[m.end():] if m else stem
+                return re.sub(r'\.XML$', '', raw, flags=re.IGNORECASE).upper()
+
+            slug_to_page = {}
+            for (_, pdf_path, _is), page_off in zip(proc_pairs, offsets):
+                slug_to_page[_slug_from_pdf(pdf_path)] = page_off
+
+            # Linked PDFs: append sequentially after all proc pages
+            total_proc_pages = sum(page_counts)
+            link_page_cursor = n_title_pages + actual_toc_pages + total_proc_pages
+            for slug, pdf_path in linked_pdfs:
+                if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+                    slug_to_page[slug.upper()] = link_page_cursor
+                    link_page_cursor += len(PdfReader(pdf_path).pages)
+
+        n_patched = patch_goto_links(writer, slug_to_page)
+        if n_patched:
+            import logging as _log
+            _log.getLogger(__name__).debug('Patched %d GoTo link annotations', n_patched)
+
+    # ── 8. Write output ───────────────────────────────────────────────────────
     with open(out_path, 'wb') as f:
         writer.write(f)
     writer.close()
@@ -334,6 +388,60 @@ def build_final_pdf(
         os.unlink(toc_pdf_path)
     except OSError:
         pass
+
+
+def patch_goto_links(writer: PdfWriter, slug_to_page: dict[str, int]) -> int:
+    """Replace bmwlink://SLUG URI annotations with GoTo page-number actions.
+
+    WeasyPrint turns href="bmwlink://SLUG" into PDF URI actions.  After merging,
+    this function iterates every page's link annotations and replaces any
+    bmwlink:// URI action with a GoTo action that jumps to the correct page.
+
+    Args:
+        writer:        The PdfWriter containing the fully merged document.
+        slug_to_page:  Mapping of SLUG (upper-case filename without .XML) →
+                       0-based page index in the merged PDF.
+
+    Returns the number of annotations patched.
+    """
+    patched = 0
+    for page_num, page in enumerate(writer.pages):
+        annots = page.get('/Annots')
+        if not annots:
+            continue
+        for annot_ref in annots:
+            try:
+                annot = annot_ref.get_object()
+            except Exception:
+                continue
+            if annot.get('/Subtype') != '/Link':
+                continue
+            action = annot.get('/A')
+            if action is None:
+                continue
+            try:
+                action_obj = action.get_object()
+            except Exception:
+                action_obj = action
+            if action_obj.get('/S') != '/URI':
+                continue
+            uri = str(action_obj.get('/URI', ''))
+            if not uri.startswith('bmwlink://'):
+                continue
+            slug = uri[len('bmwlink://'):].upper()
+            target_page = slug_to_page.get(slug)
+            if target_page is None:
+                continue
+            # Replace URI action with a GoTo action pointing to target page
+            target_page_ref = writer.pages[target_page].indirect_reference
+            new_dest = ArrayObject([target_page_ref, NameObject('/Fit')])
+            new_action = DictionaryObject({
+                NameObject('/S'): NameObject('/GoTo'),
+                NameObject('/D'): new_dest,
+            })
+            annot[NameObject('/A')] = new_action
+            patched += 1
+    return patched
 
 
 def html_to_pdf(html_str: str, out_path: str, base_url: str | None = None) -> bool:
