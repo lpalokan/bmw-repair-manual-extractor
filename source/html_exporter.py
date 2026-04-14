@@ -25,6 +25,7 @@ _SCREEN_CSS = """
          max-width: 960px; margin: 0 auto; padding: 16px; }
   img  { max-width: 100% !important; height: auto !important; }
   table { max-width: 100% !important; word-break: break-word; }
+  col { width: auto !important; }
   td, th { overflow-wrap: break-word; word-break: break-word; }
   td[style*="padding-left:8mm"] { padding-left: 2mm !important; }
   table[border="0"] > tbody > tr > td[style*="padding-left"] { padding-left: 2mm !important; }

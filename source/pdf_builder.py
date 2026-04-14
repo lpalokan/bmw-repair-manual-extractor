@@ -40,6 +40,14 @@ table {
     word-break: break-word;
 }
 
+/* The XSL sets <col width="1%"> for variant code columns and <col width="96%">
+   for description columns. 1% of a full-width table is ~7px — far too narrow
+   to render even short codes like "0524". Override all col widths and let the
+   browser use automatic layout so columns size to their content instead. */
+col {
+    width: auto !important;
+}
+
 /* Images: scale down to fit, never overflow */
 img {
     max-width: 100% !important;
