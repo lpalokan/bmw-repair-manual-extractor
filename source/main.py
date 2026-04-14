@@ -17,6 +17,7 @@ Examples:
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import config
 from gdb_reader import GdbReader, decode_db
 from model_registry import list_models, get_model_info
-from pdf_builder import merge_pdfs, make_title_page_html, html_to_pdf
+from pdf_builder import build_final_pdf, make_title_page_html, html_to_pdf
 from html_exporter import export_model_html
 
 # Batch size for subprocess rendering: keeps each worker process small enough
@@ -119,13 +120,11 @@ def cmd_extract(model, out, subdir, limit):
 
     data_parent = os.path.dirname(config.DATA_DIR)
     tmp_dir = tempfile.mkdtemp(prefix=f'bmw_{model}_')
-    pdf_files: list[str] = []
 
     # Title page (rendered in-process; it's just one page, safe to do directly)
     title_html = make_title_page_html(model_info.name, model, model_info.image_path)
     title_pdf = os.path.join(tmp_dir, '000_title.pdf')
-    if html_to_pdf(title_html, title_pdf):
-        pdf_files.append(title_pdf)
+    html_to_pdf(title_html, title_pdf)
 
     # Render procedures in subprocess batches to avoid WeasyPrint/Pango crash
     # on macOS ARM64 (FcConfigDestroy SIGSEGV when GC finalizes font objects
@@ -134,30 +133,51 @@ def cmd_extract(model, out, subdir, limit):
     fail_count = 0
     total = len(paths)
 
+    # all_proc_pairs: ordered list of (db_path, pdf_path) for rendered procedures
+    all_proc_pairs: list[tuple[str, str]] = []
+
     for batch_start in range(0, total, _BATCH_SIZE):
         batch = paths[batch_start:batch_start + _BATCH_SIZE]
         batch_end = batch_start + len(batch)
         click.echo(f'  Rendering [{batch_start+1}–{batch_end}/{total}] in subprocess...')
 
-        confirmed, new_pdfs = _run_worker_batch(worker, batch, tmp_dir)
-        pdf_files.extend(new_pdfs)
+        confirmed, new_pairs = _run_worker_batch(worker, batch, tmp_dir)
+        all_proc_pairs.extend(new_pairs)
 
-        if proc_crashed := (len(confirmed) < len(batch)):
+        if len(confirmed) < len(batch):
             missing = [p for p in batch if p not in confirmed]
             click.echo(f'  Worker crashed (SIGSEGV); retrying {len(missing)} path(s) one-by-one...', err=True)
             for path in missing:
-                _, retry_pdfs = _run_worker_batch(worker, [path], tmp_dir)
-                pdf_files.extend(retry_pdfs)
-                if retry_pdfs:
+                _, retry_pairs = _run_worker_batch(worker, [path], tmp_dir)
+                all_proc_pairs.extend(retry_pairs)
+                if retry_pairs:
                     click.echo(f'    RETRY OK: {os.path.basename(path)}')
                 else:
                     fail_count += 1
                     click.echo(f'    RETRY FAIL: {path}', err=True)
 
+    # ── Look up English titles for TOC ────────────────────────────────────────
+    click.echo(f'\nLooking up procedure titles for table of contents...')
+    reader = GdbReader(config.DECODED_DB)
+    toc_proc_pairs: list[tuple[str, str]] = []  # (title, pdf_path)
+    for db_path, pdf_path in all_proc_pairs:
+        xml = reader.get_xml_exact(db_path) or ''
+        m = re.search(r'<EMPH[^>]*BOLD="1"[^>]*>([^<]+)', xml)
+        if m:
+            title = m.group(1).strip()
+        else:
+            # Fallback: derive from path
+            basename = db_path.replace('\\', '/').rsplit('/', 1)[-1]
+            nm = re.search(r'\d{4}_\d{2}_\d+_(.+)_POS\.XML$', basename, re.IGNORECASE)
+            title = nm.group(1).replace('_', ' ').title() if nm else re.sub(r'\.XML$', '', basename, flags=re.IGNORECASE)
+        toc_proc_pairs.append((title, pdf_path))
+    reader.close()
+
+    # ── Build final PDF with TOC, bookmarks and clickable links ───────────────
     safe_name = model_info.name.replace(' ', '_').replace('/', '-')
     merged_path = os.path.join(out_dir, f'BMW_{safe_name}_{model}_Repair_Manual.pdf')
-    click.echo(f'\nMerging {len(pdf_files)} PDFs → {merged_path}')
-    merge_pdfs(pdf_files, merged_path)
+    click.echo(f'Building final PDF with table of contents → {merged_path}')
+    build_final_pdf(title_pdf, toc_proc_pairs, merged_path)
 
     import pypdf
     page_count = len(pypdf.PdfReader(merged_path).pages)
@@ -244,12 +264,16 @@ def cmd_serve(port, host, debug):
     app.run(host=host, port=port, debug=debug)
 
 
-def _run_worker_batch(worker: str, batch: list[str], tmp_dir: str) -> tuple[set[str], list[str]]:
+def _run_worker_batch(
+    worker: str, batch: list[str], tmp_dir: str
+) -> tuple[set[str], list[tuple[str, str]]]:
     """Run render_worker.py for a batch of DB paths.
 
-    Returns (confirmed_paths, pdf_files) where confirmed_paths is the set of
-    paths that produced an OK or SKIP response (i.e. were processed before any
-    crash), and pdf_files is the list of successfully rendered PDF paths.
+    Returns (confirmed_paths, proc_pairs) where:
+      - confirmed_paths: set of DB paths that produced an OK or SKIP response
+        (i.e. were fully processed before any crash)
+      - proc_pairs: ordered list of (db_path, pdf_path) for successfully
+        rendered procedures (OK status only, in output order)
     """
     proc = subprocess.Popen(
         [sys.executable, worker,
@@ -268,18 +292,18 @@ def _run_worker_batch(worker: str, batch: list[str], tmp_dir: str) -> tuple[set[
             click.echo(f'    WARN: {line}', err=True)
 
     confirmed: set[str] = set()
-    pdf_files: list[str] = []
+    proc_pairs: list[tuple[str, str]] = []   # (db_path, pdf_path)
 
     for line in stdout.strip().split('\n'):
         if not line:
             continue
         parts = line.split('\t', 2)
-        status = parts[0] if parts else '?'
+        status   = parts[0] if parts else '?'
         pdf_path = parts[1] if len(parts) > 1 else ''
-        db_path = parts[2] if len(parts) > 2 else ''
+        db_path  = parts[2] if len(parts) > 2 else ''
         if status == 'OK':
             confirmed.add(db_path)
-            pdf_files.append(pdf_path)
+            proc_pairs.append((db_path, pdf_path))
             if len(batch) > 1:
                 click.echo(f'    OK: {os.path.basename(db_path)}')
         elif status == 'SKIP':
@@ -288,7 +312,7 @@ def _run_worker_batch(worker: str, batch: list[str], tmp_dir: str) -> tuple[set[
         else:
             click.echo(f'    FAIL: {db_path}', err=True)
 
-    return confirmed, pdf_files
+    return confirmed, proc_pairs
 
 
 def _ensure_db():

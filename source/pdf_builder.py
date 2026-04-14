@@ -3,11 +3,13 @@ HTML → PDF generator and merger.
 """
 
 import logging
+import math
 import os
+import tempfile
 import warnings
 from datetime import date
 
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 from weasyprint import HTML, CSS
 
 # Suppress pypdf annotation merge warnings (harmless cross-doc link issues)
@@ -76,6 +78,239 @@ td[style*="padding-left:8mm"] {
 /* Hide interactive/navigation elements irrelevant in print */
 input, button, script, .noPrint { display: none !important; }
 """)
+
+
+# ── TOC layout constants (must match _TOC_CSS exactly) ───────────────────────
+# All values in PDF points (1 pt = 1/72 inch).  A4 = 595.28 × 841.89 pt.
+_PAGE_W_PT   = 595.28
+_PAGE_H_PT   = 841.89
+_MARGIN_T_PT = 42.52   # 15 mm
+_MARGIN_B_PT = 42.52   # 15 mm
+_MARGIN_L_PT = 34.02   # 12 mm
+_MARGIN_R_PT = 34.02   # 12 mm
+_CONTENT_H_PT = _PAGE_H_PT - _MARGIN_T_PT - _MARGIN_B_PT   # 756.85
+
+_TOC_LINE_H_PT = 14.0   # height of each TOC entry row (must match .toc-entry height in CSS)
+_TOC_HEAD_H_PT = 30.0   # height of the heading block on page 1 (must match .toc-heading CSS)
+
+_TOC_ENTRIES_PAGE1 = int((_CONTENT_H_PT - _TOC_HEAD_H_PT) / _TOC_LINE_H_PT)   # 51
+_TOC_ENTRIES_PAGEN = int(_CONTENT_H_PT / _TOC_LINE_H_PT)                        # 54
+
+
+def _toc_page_count(n_entries: int) -> int:
+    """Return the number of TOC pages needed for n_entries procedures."""
+    if n_entries == 0:
+        return 0
+    if n_entries <= _TOC_ENTRIES_PAGE1:
+        return 1
+    remaining = n_entries - _TOC_ENTRIES_PAGE1
+    return 1 + math.ceil(remaining / _TOC_ENTRIES_PAGEN)
+
+
+def _toc_entry_rect(global_idx: int) -> tuple[float, float, float, float, int]:
+    """Return the PDF-coordinate bounding box and TOC-local page index for entry i.
+
+    Returns (x1, y1, x2, y2, toc_page_idx) where:
+      - (x1, y1) is the bottom-left corner (PDF origin = page bottom-left)
+      - (x2, y2) is the top-right corner
+      - toc_page_idx is 0-based index within the TOC pages
+    """
+    if global_idx < _TOC_ENTRIES_PAGE1:
+        toc_page = 0
+        local_idx = global_idx
+        # Entry sits below the heading block
+        y_top_from_top = _MARGIN_T_PT + _TOC_HEAD_H_PT + local_idx * _TOC_LINE_H_PT
+    else:
+        remaining   = global_idx - _TOC_ENTRIES_PAGE1
+        toc_page    = 1 + remaining // _TOC_ENTRIES_PAGEN
+        local_idx   = remaining % _TOC_ENTRIES_PAGEN
+        y_top_from_top = _MARGIN_T_PT + local_idx * _TOC_LINE_H_PT
+
+    # Convert CSS top-of-entry → PDF coordinates (y=0 at bottom)
+    y2 = _PAGE_H_PT - y_top_from_top           # top edge of entry box
+    y1 = y2 - _TOC_LINE_H_PT                   # bottom edge of entry box
+    x1 = _MARGIN_L_PT
+    x2 = _PAGE_W_PT - _MARGIN_R_PT
+    return x1, y1, x2, y2, toc_page
+
+
+def make_toc_html(entries: list[tuple[str, int]]) -> str:
+    """Generate TOC page HTML.
+
+    Args:
+        entries: list of (procedure_title, display_page_number) — page numbers
+                 are 1-indexed as they will appear in the merged PDF.
+    """
+    rows = []
+    for name, page_num in entries:
+        safe = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        rows.append(
+            f'<div class="toc-entry">'
+            f'<span class="toc-title">{safe}</span>'
+            f'<span class="toc-page">{page_num}</span>'
+            f'</div>'
+        )
+    rows_html = '\n'.join(rows)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<style>
+@page {{ size: A4 portrait; margin: 15mm 12mm 15mm 12mm; }}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ font-family: Helvetica, Arial, sans-serif; font-size: 9pt; }}
+.toc-heading {{
+    height: {_TOC_HEAD_H_PT}pt;
+    line-height: {_TOC_HEAD_H_PT}pt;
+    font-size: 16pt;
+    font-weight: bold;
+    color: #003399;
+    overflow: hidden;
+}}
+.toc-entry {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    height: {_TOC_LINE_H_PT}pt;
+    line-height: {_TOC_LINE_H_PT}pt;
+    overflow: hidden;
+    border-bottom: 0.3pt solid #e0e0e0;
+}}
+.toc-title {{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    padding-right: 8pt;
+}}
+.toc-page {{
+    flex-shrink: 0;
+    text-align: right;
+    color: #444;
+    min-width: 24pt;
+}}
+</style>
+</head>
+<body>
+<div class="toc-heading">Table of Contents</div>
+{rows_html}
+</body>
+</html>"""
+
+
+def build_final_pdf(
+    title_pdf: str,
+    proc_pairs: list[tuple[str, str]],
+    out_path: str,
+) -> None:
+    """Build the final merged PDF with title page, TOC, procedures, bookmarks and links.
+
+    Args:
+        title_pdf:   Path to the already-rendered title-page PDF.
+        proc_pairs:  Ordered list of (procedure_title, pdf_path) for each procedure.
+        out_path:    Destination path for the merged PDF.
+    """
+    from pypdf.annotations import Link
+
+    proc_titles = [t for t, _ in proc_pairs]
+    proc_pdfs   = [p for _, p in proc_pairs]
+
+    # ── 1. Count pages in each procedure PDF ─────────────────────────────────
+    page_counts: list[int] = []
+    for pdf_path in proc_pdfs:
+        if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+            page_counts.append(len(PdfReader(pdf_path).pages))
+        else:
+            page_counts.append(0)
+
+    n_procs = len(proc_pdfs)
+
+    # Cumulative page offsets within the procedure block (0-based within procs)
+    cumulative = [0] * n_procs
+    for i in range(1, n_procs):
+        cumulative[i] = cumulative[i - 1] + page_counts[i - 1]
+
+    # ── 2. Compute TOC pages (may need two passes if count differs) ──────────
+    n_title_pages = 1 if (os.path.exists(title_pdf) and os.path.getsize(title_pdf) > 0) else 0
+    n_toc_pages   = _toc_page_count(n_procs)
+
+    def _proc_page_offsets(n_toc: int) -> list[int]:
+        """0-based page index in the final PDF for the first page of each procedure."""
+        return [n_title_pages + n_toc + cumulative[i] for i in range(n_procs)]
+
+    def _display_pages(offsets: list[int]) -> list[int]:
+        return [off + 1 for off in offsets]  # 1-indexed for display
+
+    offsets      = _proc_page_offsets(n_toc_pages)
+    display_nums = _display_pages(offsets)
+
+    # ── 3. Render TOC to a temporary PDF ─────────────────────────────────────
+    toc_tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+    toc_tmp.close()
+    toc_pdf_path = toc_tmp.name
+
+    def _render_toc(titles: list[str], pages: list[int], dest: str) -> int:
+        toc_html_str = make_toc_html(list(zip(titles, pages)))
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            HTML(string=toc_html_str).write_pdf(dest, stylesheets=[])
+        return len(PdfReader(dest).pages)
+
+    actual_toc_pages = _render_toc(proc_titles, display_nums, toc_pdf_path)
+
+    # If WeasyPrint paginated differently than predicted, recompute and re-render once
+    if actual_toc_pages != n_toc_pages:
+        n_toc_pages  = actual_toc_pages
+        offsets      = _proc_page_offsets(n_toc_pages)
+        display_nums = _display_pages(offsets)
+        actual_toc_pages = _render_toc(proc_titles, display_nums, toc_pdf_path)
+
+    # ── 4. Merge: title + TOC + procedures ───────────────────────────────────
+    writer = PdfWriter()
+
+    if n_title_pages:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            writer.append(title_pdf)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        writer.append(toc_pdf_path)
+
+    for pdf_path in proc_pdfs:
+        if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                writer.append(pdf_path)
+
+    # ── 5. Sidebar bookmarks (outline) ───────────────────────────────────────
+    for title, page_off in zip(proc_titles, offsets):
+        writer.add_outline_item(title, page_off)
+
+    # ── 6. Clickable link annotations on TOC pages ───────────────────────────
+    toc_first_page_in_pdf = n_title_pages   # 0-based index in final PDF
+
+    for i, (title, proc_page_off) in enumerate(zip(proc_titles, offsets)):
+        x1, y1, x2, y2, toc_local = _toc_entry_rect(i)
+        abs_page = toc_first_page_in_pdf + toc_local   # 0-based in final PDF
+
+        annotation = Link(
+            rect=[x1, y1, x2, y2],
+            border=[0, 0, 0],
+            target_page_index=proc_page_off,
+        )
+        writer.add_annotation(page_number=abs_page, annotation=annotation)
+
+    # ── 7. Write output ───────────────────────────────────────────────────────
+    with open(out_path, 'wb') as f:
+        writer.write(f)
+    writer.close()
+
+    try:
+        os.unlink(toc_pdf_path)
+    except OSError:
+        pass
 
 
 def html_to_pdf(html_str: str, out_path: str, base_url: str | None = None) -> bool:
