@@ -22,6 +22,26 @@ from render import xml_to_html
 
 # ── image URL rewriting ──────────────────────────────────────────────────────
 
+def _rewrite_link_hrefs(html: str, code: str) -> str:
+    """
+    Rewrite internal link:: procedure references to Flask /procedure/ routes.
+
+    The XSLT produces cross-procedure links in the form:
+      href="link::BMW-Motorrad/AUS/1111_0458_01_Motorhalter_ausbauen_AUS.xml"
+
+    These are converted to:
+      href="/procedure/0458/BMW-Motorrad/AUS/1111_0458_01_Motorhalter_ausbauen_AUS.xml"
+
+    get_xml_exact() in the route handler normalises the path to upper-case
+    backslash internally, so the mixed-case forward-slash form is fine in the URL.
+    """
+    return re.sub(
+        r'href="link::(BMW-Motorrad[^"]+)"',
+        lambda m: f'href="/procedure/{code}/{m.group(1)}"',
+        html,
+    )
+
+
 def _rewrite_image_urls(html: str) -> str:
     """
     Replace file:// image URLs produced by render.xml_to_html with Flask
@@ -136,6 +156,7 @@ def create_app() -> 'Flask':
         data_parent = os.path.dirname(config.DATA_DIR)
         html = xml_to_html(xml, config.XSL_PATH, data_parent)
         html = _rewrite_image_urls(html)
+        html = _rewrite_link_hrefs(html, code)
 
         # Inject screen CSS and back-navigation
         screen_css = """<style>

@@ -130,12 +130,28 @@ class GdbReader:
         return _decompress_blob(blob)
 
     def list_paths(self, model_code: str, subdir: str = 'POS') -> list[str]:
-        """Return all DB paths for the given model code in the given subdir."""
+        """Return all DB paths for the given model code in the given subdir.
+
+        Sorted by the numeric BMW procedure number embedded in the filename
+        (e.g. 1100038 → 11 00 038), which matches the workshop manual order.
+        Alphabetical string sort is wrong because section prefix length varies
+        ('11_' vs '1111_'), causing 2-digit sections to sort after 4-digit ones.
+        """
         pattern = f'%\\{subdir}\\%{model_code}%'.encode()
         rows = self.conn.execute(
             "SELECT path FROM XML WHERE path LIKE ?", [pattern]
         ).fetchall()
-        return sorted(r[0].decode() for r in rows)
+
+        def _sort_key(path: str) -> int:
+            # Filename format: SECTION_MODEL_REVISION_PROCNUM_NAME_TYPE.XML
+            # PROCNUM is always at split index 3 and is a 5-8 digit number.
+            parts = path.rsplit('\\', 1)[-1].split('_')
+            try:
+                return int(parts[3])
+            except (IndexError, ValueError):
+                return 0
+
+        return sorted((r[0].decode() for r in rows), key=_sort_key)
 
     def get_xml_by_rowid(self, rowid: int) -> str | None:
         row = self.conn.execute(
