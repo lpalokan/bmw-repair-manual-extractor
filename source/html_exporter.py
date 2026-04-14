@@ -223,6 +223,7 @@ def _render_and_write(
         return None, []
 
     html = xml_to_html(xml, xsl_path, data_parent)
+    html = html.replace('\xa0', '&nbsp;')   # prevent Â artefact in browsers
     html, _ = _collect_and_copy_images(html, images_dir, data_parent)
 
     # Collect link targets BEFORE rewriting them so the originals are readable

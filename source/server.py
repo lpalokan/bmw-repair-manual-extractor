@@ -176,6 +176,7 @@ def create_app() -> 'Flask':
 
         data_parent = os.path.dirname(config.DATA_DIR)
         html = xml_to_html(xml, config.XSL_PATH, data_parent)
+        html = html.replace('\xa0', '&nbsp;')   # prevent Â artefact in browsers
         html = _rewrite_image_urls(html)
         html = _rewrite_link_hrefs(html, code)
 
