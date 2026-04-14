@@ -102,8 +102,12 @@ def create_app() -> 'Flask':
     def _build_procedure_list(code: str) -> list[dict]:
         """Read all POS-subdir paths for a model, extract real titles from XML."""
         _SUFFIX_LABELS = {
-            '_AD': 'Technical data', '_BS': 'Safety', '_SW': 'Tools',
-            '_TD': 'Torque', '_WAU': 'Notes', '_REPSCH': 'Diagram',
+            '_AD': 'Tightening Torques',
+            '_BS': 'Lubricants / Fluids',
+            '_SW': 'Special Tools',
+            '_TD': 'Technical Data',
+            '_WAU': 'Workshop Equipment',
+            '_REPSCH': 'Repair Scheme',
         }
 
         reader = GdbReader(config.DECODED_DB)

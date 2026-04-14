@@ -44,6 +44,41 @@ def _proc_slug(db_path: str) -> str:
     return re.sub(r'\.XML$', '', basename, flags=re.IGNORECASE).upper()
 
 
+def _proc_num_from_path(db_path: str) -> str:
+    """Extract the BMW procedure number (parts[3] in the filename, e.g. '1100038')."""
+    parts = db_path.rsplit('\\', 1)[-1].split('_')
+    return parts[3] if len(parts) > 3 else ''
+
+
+def _doc_type_from_path(db_path: str) -> str:
+    """Extract the document type from the filename suffix (POS, AD, SW, BS, …)."""
+    basename = db_path.rsplit('\\', 1)[-1].upper()
+    return basename.rsplit('_', 1)[-1].replace('.XML', '')
+
+
+# Human-readable labels for sub-document types
+_TYPE_LABELS: dict[str, str] = {
+    'AD':     'Tightening Torques',
+    'SW':     'Special Tools',
+    'BS':     'Lubricants / Fluids',
+    'TD':     'Technical Data',
+    'WAU':    'Workshop Equipment',
+    'REPSCH': 'Repair Scheme',
+}
+
+
+def _clean_subdoc_label(title: str) -> str:
+    """Strip leading proc-number prefix and trailing model-code suffix from sub-doc titles.
+
+    Examples:
+      '11 00 038 Tightening torques' → 'Tightening torques'
+      'Tightening torques 0458 - HP2 Sport' → 'Tightening torques'
+    """
+    title = re.sub(r'^\d[\d\s]{3,10}\s+', '', title).strip()
+    title = re.sub(r'\s+\d{4}\s*[-\u2013].*$', '', title).strip()
+    return title
+
+
 def _link_to_db_path(link_path: str) -> str:
     """Convert a link:: path to a normalised DB path (upper-case, backslash).
 
@@ -218,14 +253,20 @@ def export_model_html(
                  f'&larr; {model_info.name} ({model_info.code})</a>')
 
     reader = GdbReader(config.DECODED_DB)
-    procedures: list[dict] = []   # index entries (POS procedures only)
-    rendered: set[str] = set()    # normalised DB paths already written to disk
-    pending: list[str] = []       # linked docs queued for BFS rendering
+    # groups: one entry per main (POS) procedure, each carrying its sub-docs
+    groups: list[dict] = []
+    current_group: dict | None = None   # group being built (most recent POS)
+    current_proc_num: str = ''          # proc number of current_group
+    rendered: set[str] = set()          # normalised DB paths already written to disk
+    pending: list[str] = []             # linked docs queued for BFS rendering
     total = len(paths)
 
-    # ── Phase 1: render primary (POS) procedures ──────────────────────────────
+    # ── Phase 1: render all docs (POS + sub-docs) and build grouped index ────
     for i, db_path in enumerate(paths):
-        norm = db_path.upper()
+        norm     = db_path.upper()
+        proc_num = _proc_num_from_path(db_path)
+        doc_type = _doc_type_from_path(db_path)
+        is_main  = (doc_type == 'POS')
         rendered.add(norm)
 
         if on_progress:
@@ -235,17 +276,38 @@ def export_model_html(
         if not xml:
             continue
 
-        name = _proc_display_name(db_path, xml)
+        # Determine display label
+        raw_name = _proc_display_name(db_path, xml)
+        if is_main:
+            display_name = raw_name
+        else:
+            cleaned = _clean_subdoc_label(raw_name)
+            display_name = cleaned or _TYPE_LABELS.get(doc_type, doc_type)
+
         slug, linked = _render_and_write(
             db_path, reader, xsl_path, data_parent,
             images_dir, procedures_dir, back_html,
         )
-        if slug:
-            procedures.append({'slug': slug, 'name': name,
-                                'filename': slug + '.html'})
-            for lp in linked:
-                if lp not in rendered:
-                    pending.append(lp)
+        if not slug:
+            continue
+
+        if is_main:
+            current_group = {
+                'name':          display_name,
+                'main_filename': slug + '.html',
+                'sub_docs':      [],
+            }
+            groups.append(current_group)
+            current_proc_num = proc_num
+        elif current_group and proc_num == current_proc_num:
+            current_group['sub_docs'].append({
+                'label':    display_name,
+                'filename': slug + '.html',
+            })
+
+        for lp in linked:
+            if lp not in rendered:
+                pending.append(lp)
 
     # ── Phase 2: BFS over linked documents ────────────────────────────────────
     linked_count = 0
@@ -279,10 +341,20 @@ def export_model_html(
         cover_img_tag = (f'<img src="images/{cover_filename}" '
                          f'style="max-height:140px;margin-bottom:16px;display:block">')
 
-    proc_items = '\n'.join(
-        f'    <li><a href="procedures/{p["filename"]}">{p["name"]}</a></li>'
-        for p in procedures
-    )
+    def _render_group(g: dict) -> str:
+        main_link = (f'<a class="proc-main" href="procedures/{g["main_filename"]}">'
+                     f'{g["name"]}</a>')
+        if g['sub_docs']:
+            pills = ' '.join(
+                f'<a class="proc-sub" href="procedures/{s["filename"]}">{s["label"]}</a>'
+                for s in g['sub_docs']
+            )
+            subs_div = f'<div class="proc-subs">{pills}</div>'
+        else:
+            subs_div = ''
+        return f'<div class="proc-group">{main_link}{subs_div}</div>'
+
+    proc_items = '\n'.join(_render_group(g) for g in groups)
 
     index_html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -291,22 +363,34 @@ def export_model_html(
   <title>BMW {model_info.name} ({model_info.code}) — Repair Manual</title>
   <style>
     body {{ font-family: Helvetica, Arial, sans-serif; font-size: 10pt;
-             max-width: 800px; margin: 0 auto; padding: 24px; }}
+             max-width: 800px; margin: 0 auto; padding: 24px; background: #f5f5f5; }}
     h1   {{ color: #003399; margin-bottom: 4px; }}
     .subtitle {{ color: #666; margin-top: 0; font-size: 11pt; }}
-    ul   {{ list-style: none; padding: 0; margin-top: 16px; }}
-    li a {{ display: block; padding: 7px 10px; border-bottom: 1px solid #eee;
-             text-decoration: none; color: #222; }}
-    li a:hover {{ background: #f0f4ff; color: #003399; }}
+    .proc-list {{ margin-top: 16px; }}
+    .proc-group {{ background: #fff; border: 1px solid #ddd; border-radius: 5px;
+                   margin-bottom: 6px; overflow: hidden; }}
+    /* Main procedure link — bold, full-width clickable row */
+    .proc-main {{ display: block; padding: 10px 14px;
+                  font-weight: 600; font-size: 10pt;
+                  color: #111; text-decoration: none; }}
+    .proc-main:hover {{ background: #f0f4ff; color: #003399; }}
+    /* Sub-document pills (tightening torques, special tools, …) */
+    .proc-subs {{ display: flex; flex-wrap: wrap; gap: 4px;
+                  padding: 0 14px 8px;
+                  border-top: 1px solid #f0f0f0; }}
+    .proc-sub {{ font-size: 9pt; color: #555; text-decoration: none;
+                 background: #f4f4f4; border: 1px solid #ddd;
+                 border-radius: 3px; padding: 2px 8px; }}
+    .proc-sub:hover {{ background: #e8eeff; color: #003399; border-color: #aac; }}
   </style>
 </head>
 <body>
   {cover_img_tag}
   <h1>BMW {model_info.name}</h1>
-  <p class="subtitle">Model {model_info.code} &mdash; {len(procedures)} repair procedures</p>
-  <ul>
+  <p class="subtitle">Model {model_info.code} &mdash; {len(groups)} repair procedures</p>
+  <div class="proc-list">
 {proc_items}
-  </ul>
+  </div>
 </body>
 </html>"""
 
