@@ -159,18 +159,31 @@ def cmd_extract(model, out, subdir, limit):
     # ── Look up English titles for TOC ────────────────────────────────────────
     click.echo(f'\nLooking up procedure titles for table of contents...')
     reader = GdbReader(config.DECODED_DB)
-    toc_proc_pairs: list[tuple[str, str]] = []  # (title, pdf_path)
+    toc_proc_pairs: list[tuple[str, str, bool]] = []  # (title, pdf_path, is_main)
     for db_path, pdf_path in all_proc_pairs:
+        basename = db_path.replace('\\', '/').rsplit('/', 1)[-1].upper()
+        is_main  = basename.endswith('_POS.XML')
+
         xml = reader.get_xml_exact(db_path) or ''
         m = re.search(r'<EMPH[^>]*BOLD="1"[^>]*>([^<]+)', xml)
         if m:
             title = m.group(1).strip()
+            if not is_main:
+                # Strip leading "NN NN NNN " procedure-number prefix from sub-docs
+                # so "11 11 120 Tightening Torques" → "Tightening Torques"
+                title = re.sub(r'^\d[\d\s]{3,10}\s+', '', title).strip()
+                # Strip trailing " NNNN - ModelName" model suffix
+                # so "Tightening torques 0458 - HP2 Sport" → "Tightening torques"
+                title = re.sub(r'\s+\d{4}\s*[-\u2013].*$', '', title).strip()
         else:
             # Fallback: derive from path
-            basename = db_path.replace('\\', '/').rsplit('/', 1)[-1]
-            nm = re.search(r'\d{4}_\d{2}_\d+_(.+)_POS\.XML$', basename, re.IGNORECASE)
-            title = nm.group(1).replace('_', ' ').title() if nm else re.sub(r'\.XML$', '', basename, flags=re.IGNORECASE)
-        toc_proc_pairs.append((title, pdf_path))
+            nm = re.search(r'\d{4}_\d{2}_\d+_(.+?)_(\w+)\.XML$', basename, re.IGNORECASE)
+            if nm:
+                title = nm.group(1).replace('_', ' ').title()
+            else:
+                title = re.sub(r'\.XML$', '', basename, flags=re.IGNORECASE)
+
+        toc_proc_pairs.append((title, pdf_path, is_main))
     reader.close()
 
     # ── Build final PDF with TOC, bookmarks and clickable links ───────────────

@@ -132,24 +132,37 @@ class GdbReader:
     def list_paths(self, model_code: str, subdir: str = 'POS') -> list[str]:
         """Return all DB paths for the given model code in the given subdir.
 
-        Sorted by the numeric BMW procedure number embedded in the filename
-        (e.g. 1100038 → 11 00 038), which matches the workshop manual order.
-        Alphabetical string sort is wrong because section prefix length varies
-        ('11_' vs '1111_'), causing 2-digit sections to sort after 4-digit ones.
+        Sorted by (proc_number, doc_type) so that within each procedure group
+        the main POS document always comes first, followed by AD (tightening
+        torques), BS (lubricants), SW (special tools), and so on.
+
+        Numeric procedure sort is required because alphabetical sort is wrong
+        when section prefix lengths vary ('11_' vs '1111_').
         """
         pattern = f'%\\{subdir}\\%{model_code}%'.encode()
         rows = self.conn.execute(
             "SELECT path FROM XML WHERE path LIKE ?", [pattern]
         ).fetchall()
 
-        def _sort_key(path: str) -> int:
-            # Filename format: SECTION_MODEL_REVISION_PROCNUM_NAME_TYPE.XML
-            # PROCNUM is always at split index 3 and is a 5-8 digit number.
-            parts = path.rsplit('\\', 1)[-1].split('_')
+        # Within a procedure group, POS is the main entry; everything else is
+        # supplementary.  Lower order value → sorts first.
+        _TYPE_ORDER = {
+            'POS': 0, 'AD': 1, 'BS': 2, 'SW': 3,
+            'TD': 4, 'REPSCH': 5, 'WAU': 6,
+        }
+
+        def _sort_key(path: str) -> tuple[int, int]:
+            # Filename: SECTION_MODEL_REVISION_PROCNUM_NAME_TYPE.XML
+            basename = path.rsplit('\\', 1)[-1]
+            parts = basename.split('_')
             try:
-                return int(parts[3])
+                proc_num = int(parts[3])
             except (IndexError, ValueError):
-                return 0
+                proc_num = 0
+            # Suffix: last underscore-separated token, strip .XML extension
+            suffix = basename.rsplit('_', 1)[-1].upper().replace('.XML', '')
+            type_order = _TYPE_ORDER.get(suffix, 99)
+            return proc_num, type_order
 
         return sorted((r[0].decode() for r in rows), key=_sort_key)
 

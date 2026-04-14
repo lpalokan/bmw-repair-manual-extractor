@@ -134,18 +134,22 @@ def _toc_entry_rect(global_idx: int) -> tuple[float, float, float, float, int]:
     return x1, y1, x2, y2, toc_page
 
 
-def make_toc_html(entries: list[tuple[str, int]]) -> str:
+def make_toc_html(entries: list[tuple[str, int, bool]]) -> str:
     """Generate TOC page HTML.
 
     Args:
-        entries: list of (procedure_title, display_page_number) — page numbers
-                 are 1-indexed as they will appear in the merged PDF.
+        entries: list of (title, display_page_number, is_main) where is_main=True
+                 for main POS procedures (rendered bold, no indent) and False for
+                 supplementary documents like AD (tightening torques), SW (special
+                 tools), BS (lubricants) etc. (rendered muted and indented).
+                 Page numbers are 1-indexed as they appear in the merged PDF.
     """
     rows = []
-    for name, page_num in entries:
+    for name, page_num, is_main in entries:
         safe = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        cls = 'toc-main' if is_main else 'toc-sub'
         rows.append(
-            f'<div class="toc-entry">'
+            f'<div class="toc-entry {cls}">'
             f'<span class="toc-title">{safe}</span>'
             f'<span class="toc-page">{page_num}</span>'
             f'</div>'
@@ -175,7 +179,19 @@ body {{ font-family: Helvetica, Arial, sans-serif; font-size: 9pt; }}
     height: {_TOC_LINE_H_PT}pt;
     line-height: {_TOC_LINE_H_PT}pt;
     overflow: hidden;
-    border-bottom: 0.3pt solid #e0e0e0;
+}}
+/* Main procedure: bold, full width, separator line */
+.toc-main {{
+    font-weight: bold;
+    border-bottom: 0.3pt solid #c0c0c0;
+}}
+/* Sub-document (tightening torques, special tools, etc.):
+   indented, smaller, muted colour — no border so it visually
+   attaches to the procedure above it */
+.toc-sub {{
+    padding-left: 14pt;
+    font-size: 8pt;
+    color: #555;
 }}
 .toc-title {{
     overflow: hidden;
@@ -187,7 +203,6 @@ body {{ font-family: Helvetica, Arial, sans-serif; font-size: 9pt; }}
 .toc-page {{
     flex-shrink: 0;
     text-align: right;
-    color: #444;
     min-width: 24pt;
 }}
 </style>
@@ -201,20 +216,22 @@ body {{ font-family: Helvetica, Arial, sans-serif; font-size: 9pt; }}
 
 def build_final_pdf(
     title_pdf: str,
-    proc_pairs: list[tuple[str, str]],
+    proc_pairs: list[tuple[str, str, bool]],
     out_path: str,
 ) -> None:
     """Build the final merged PDF with title page, TOC, procedures, bookmarks and links.
 
     Args:
         title_pdf:   Path to the already-rendered title-page PDF.
-        proc_pairs:  Ordered list of (procedure_title, pdf_path) for each procedure.
+        proc_pairs:  Ordered list of (title, pdf_path, is_main) where is_main=True
+                     for main POS procedures and False for sub-documents.
         out_path:    Destination path for the merged PDF.
     """
     from pypdf.annotations import Link
 
-    proc_titles = [t for t, _ in proc_pairs]
-    proc_pdfs   = [p for _, p in proc_pairs]
+    proc_titles  = [t for t, _, _is in proc_pairs]
+    proc_pdfs    = [p for _, p, _is in proc_pairs]
+    proc_is_main = [m for _, _, m in proc_pairs]
 
     # ── 1. Count pages in each procedure PDF ─────────────────────────────────
     page_counts: list[int] = []
@@ -250,21 +267,21 @@ def build_final_pdf(
     toc_tmp.close()
     toc_pdf_path = toc_tmp.name
 
-    def _render_toc(titles: list[str], pages: list[int], dest: str) -> int:
-        toc_html_str = make_toc_html(list(zip(titles, pages)))
+    def _render_toc(titles: list[str], pages: list[int], is_mains: list[bool], dest: str) -> int:
+        toc_html_str = make_toc_html(list(zip(titles, pages, is_mains)))
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             HTML(string=toc_html_str).write_pdf(dest, stylesheets=[])
         return len(PdfReader(dest).pages)
 
-    actual_toc_pages = _render_toc(proc_titles, display_nums, toc_pdf_path)
+    actual_toc_pages = _render_toc(proc_titles, display_nums, proc_is_main, toc_pdf_path)
 
     # If WeasyPrint paginated differently than predicted, recompute and re-render once
     if actual_toc_pages != n_toc_pages:
         n_toc_pages  = actual_toc_pages
         offsets      = _proc_page_offsets(n_toc_pages)
         display_nums = _display_pages(offsets)
-        actual_toc_pages = _render_toc(proc_titles, display_nums, toc_pdf_path)
+        actual_toc_pages = _render_toc(proc_titles, display_nums, proc_is_main, toc_pdf_path)
 
     # ── 4. Merge: title + TOC + procedures ───────────────────────────────────
     writer = PdfWriter()
@@ -285,8 +302,14 @@ def build_final_pdf(
                 writer.append(pdf_path)
 
     # ── 5. Sidebar bookmarks (outline) ───────────────────────────────────────
-    for title, page_off in zip(proc_titles, offsets):
-        writer.add_outline_item(title, page_off)
+    # Main procedures get top-level bookmarks; sub-docs (AD, SW, BS…) are
+    # nested under the most recent main entry.
+    current_parent = None
+    for title, page_off, is_main in zip(proc_titles, offsets, proc_is_main):
+        if is_main:
+            current_parent = writer.add_outline_item(title, page_off)
+        else:
+            writer.add_outline_item(title, page_off, parent=current_parent)
 
     # ── 6. Clickable link annotations on TOC pages ───────────────────────────
     toc_first_page_in_pdf = n_title_pages   # 0-based index in final PDF
