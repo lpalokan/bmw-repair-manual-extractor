@@ -40,7 +40,27 @@ _BATCH_SIZE = 40
 
 @click.group()
 def cli():
-    """BMW Repair Manual PDF extractor.\n\nRun 'decode-db' once first, then use 'models' to list available models."""
+    """BMW Repair Manual PDF extractor.
+
+    \b
+    Quick start:
+      python main.py decode-db            # one-time: decode the database
+      python main.py models               # list all available models
+      python main.py extract --model 0458            # short PDF (~125 MB)
+      python main.py extract --model 0458 --full     # full PDF with live links
+      python main.py export-html --model 0458        # self-contained HTML
+      python main.py serve                           # local web UI
+
+    \b
+    PDF modes (extract command):
+      (default)  Renders main procedures + tightening torques, special tools,
+                 lubricants etc. Cross-procedure links are stripped.
+      --full     Also renders all cross-referenced sub-steps (removal,
+                 installation, special work, …) and wires every internal
+                 link as a clickable GoTo page annotation. ~3× larger.
+
+    Run any command with --help for full option details.
+    """
     pass
 
 
