@@ -44,22 +44,36 @@ def _rewrite_link_hrefs(html: str, code: str) -> str:
 
 def _rewrite_image_urls(html: str) -> str:
     """
-    Replace file:// image URLs produced by render.xml_to_html with Flask
-    /image/<rel_path> routes.
+    Replace image URLs produced by render.xml_to_html with Flask /image/ routes.
 
-    render.py produces URLs like:
-      src="file:///Users/.../BMW%20Repair%20manual%20application/DATAS/BMW-Motorrad/BILD/foo.jpg"
+    Two patterns are rewritten:
 
-    The base path contains %20-encoded spaces, so we anchor on the stable
-    'BMW-Motorrad/' segment instead of trying to match the full base path.
+    1. Absolute file:// URLs (procedure diagrams):
+         src="file:///…/DATAS/BMW-Motorrad/BMW-Motorrad/BILD/foo.jpg"
+       → src="/image/BMW-Motorrad/BILD/foo.jpg"
+       We anchor on the stable 'BMW-Motorrad/' segment to avoid the %20-encoded
+       base path.
 
-    We emit: src="/image/BMW-Motorrad/BILD/foo.jpg"
+    2. Relative BMW-Motorrad/… paths inside JavaScript string literals
+       (UI icon paths hardcoded in RSD.XSL, e.g. used by Change_Icon()):
+         Change_Icon(escape('BMW-Motorrad/imgs/icon/open.gif'), …)
+       → Change_Icon(escape('/image/BMW-Motorrad/imgs/icon/open.gif'), …)
+       Without this rewrite the browser resolves the relative path against the
+       procedure page URL, landing on the procedure route instead of /image/.
     """
-    return re.sub(
+    # Pattern 1 – absolute file:// image URLs
+    html = re.sub(
         r'(src=|href=)"file://[^"]*/(BMW-Motorrad[^"]+\.(jpg|gif|png|JPG|GIF|PNG))"',
         lambda m: f'{m.group(1)}"/image/{m.group(2)}"',
         html,
     )
+    # Pattern 2 – relative BMW-Motorrad/… paths in JS string literals
+    html = re.sub(
+        r"'(BMW-Motorrad/[^']+\.(jpg|gif|png|JPG|GIF|PNG))'",
+        lambda m: f"'/image/{m.group(1)}'",
+        html,
+    )
+    return html
 
 
 # ── Flask app factory ────────────────────────────────────────────────────────
@@ -138,7 +152,10 @@ def create_app() -> 'Flask':
                 xml = reader.get_xml_exact(p) or ''
                 tm = re.search(r'<EMPH[^>]*BOLD="1"[^>]*>([^<]+)', xml)
                 if tm:
-                    proc_map[key]['name'] = tm.group(1).strip()
+                    # Replace non-breaking spaces (\xa0) with regular spaces;
+                    # in UTF-8 \xa0 encodes as \xc2\xa0 which browsers that
+                    # miss the charset hint render as "Â ".
+                    proc_map[key]['name'] = tm.group(1).replace('\xa0', ' ').strip()
             else:
                 label = _SUFFIX_LABELS.get(suffix, suffix.lstrip('_'))
                 proc_map[key]['sub_docs'].append({'label': label, 'db_path': p})

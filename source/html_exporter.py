@@ -103,11 +103,13 @@ def _proc_display_name(db_path: str, xml: str | None = None) -> str:
 
     Prefers the real title from the XML (<EMPH BOLD="1">); falls back to the
     path-derived name if the XML is unavailable or has no such element.
+    Non-breaking spaces (\xa0) are normalised to regular spaces to prevent
+    the Â artefact in browsers that miss the UTF-8 charset hint.
     """
     if xml:
         m = re.search(r'<EMPH[^>]*BOLD="1"[^>]*>([^<]+)', xml)
         if m:
-            return m.group(1).strip()
+            return m.group(1).replace('\xa0', ' ').strip()
     basename = db_path.replace('\\', '/').rsplit('/', 1)[-1]
     m = re.search(r'\d{4}_\d{2}_\d+_(.+)_(?:POS|AD|BS|SW|TD|WAU|REPSCH)\.XML$',
                   basename, re.IGNORECASE)
@@ -118,29 +120,54 @@ def _proc_display_name(db_path: str, xml: str | None = None) -> str:
 
 # ── HTML post-processing helpers ──────────────────────────────────────────────
 
-def _collect_and_copy_images(html: str, images_dir: str) -> tuple[str, set[str]]:
-    """Find all file:// image URLs, copy each into images_dir, rewrite to ../images/."""
+def _collect_and_copy_images(
+    html: str, images_dir: str, data_parent: str = ''
+) -> tuple[str, set[str]]:
+    """Find all image URLs, copy each file into images_dir, rewrite URLs to ../images/.
+
+    Handles two URL forms:
+    1. Absolute file:// URLs in src/href attributes (procedure diagrams).
+    2. Relative 'BMW-Motorrad/…' paths inside JavaScript string literals
+       (UI icons hardcoded in RSD.XSL, e.g. used by Change_Icon()).
+    """
     copied: set[str] = set()
     seen: dict[str, str] = {}   # basename → abs source path (first seen wins)
 
-    def _rewrite(m: re.Match) -> str:
-        attr = m.group(1)
-        url  = m.group(2)
-        abs_path = urllib.parse.unquote(url.removeprefix('file://'))
-        basename = os.path.basename(abs_path)
+    def _copy(abs_path: str, basename: str) -> None:
         if basename not in seen:
             seen[basename] = abs_path
             if os.path.exists(abs_path) and basename not in copied:
                 shutil.copy2(abs_path, os.path.join(images_dir, basename))
                 copied.add(basename)
+
+    def _rewrite_fileurl(m: re.Match) -> str:
+        attr     = m.group(1)
+        url      = m.group(2)
+        abs_path = urllib.parse.unquote(url.removeprefix('file://'))
+        basename = os.path.basename(abs_path)
+        _copy(abs_path, basename)
         return f'{attr}"../images/{basename}"'
 
-    rewritten = re.sub(
+    def _rewrite_js_icon(m: re.Match) -> str:
+        """Rewrite 'BMW-Motorrad/…' in JS strings and copy the icon file."""
+        rel_path = m.group(1)          # e.g. BMW-Motorrad/imgs/icon/open.gif
+        basename = os.path.basename(rel_path)
+        if data_parent:
+            abs_path = os.path.join(data_parent, rel_path.replace('/', os.sep))
+            _copy(abs_path, basename)
+        return f"'../images/{basename}'"
+
+    html = re.sub(
         r'(src=|href=)"(file://[^"]+\.(jpg|gif|png|JPG|GIF|PNG))"',
-        _rewrite,
+        _rewrite_fileurl,
         html,
     )
-    return rewritten, copied
+    html = re.sub(
+        r"'(BMW-Motorrad/[^']+\.(jpg|gif|png|JPG|GIF|PNG))'",
+        _rewrite_js_icon,
+        html,
+    )
+    return html, copied
 
 
 def _extract_link_targets(html: str) -> list[str]:
@@ -196,7 +223,7 @@ def _render_and_write(
         return None, []
 
     html = xml_to_html(xml, xsl_path, data_parent)
-    html, _ = _collect_and_copy_images(html, images_dir)
+    html, _ = _collect_and_copy_images(html, images_dir, data_parent)
 
     # Collect link targets BEFORE rewriting them so the originals are readable
     linked = _extract_link_targets(html)

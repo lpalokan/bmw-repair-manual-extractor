@@ -167,7 +167,7 @@ def cmd_extract(model, out, subdir, limit):
         xml = reader.get_xml_exact(db_path) or ''
         m = re.search(r'<EMPH[^>]*BOLD="1"[^>]*>([^<]+)', xml)
         if m:
-            title = m.group(1).strip()
+            title = m.group(1).replace('\xa0', ' ').strip()
             if not is_main:
                 # Strip leading "NN NN NNN " procedure-number prefix from sub-docs
                 # so "11 11 120 Tightening Torques" → "Tightening Torques"
