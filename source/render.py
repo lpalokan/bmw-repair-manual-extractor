@@ -69,3 +69,30 @@ def xml_to_html(xml_str: str, xsl_path: str, data_dir: str) -> str:
     )
 
     return html
+
+
+def strip_pdf_hrefs(html: str) -> str:
+    """Remove non-file hrefs that are meaningless or broken in a merged PDF.
+
+    The XSLT produces three kinds of non-image hrefs:
+      - href="link::BMW-Motorrad/..."  cross-procedure links (target not a PDF page)
+      - href="javascript:void(null)"   Windows-app expand/collapse callbacks
+      - href="#anchor"                 same-page anchors (useless across merged docs)
+
+    All three are stripped: the <a> tag is replaced with a plain <span> so the
+    visible link text is preserved but no dead hyperlink is created in the PDF.
+    """
+    # link:: and javascript: — replace whole <a href="...">...</a> with <span>
+    html = re.sub(
+        r'<a\b([^>]*)\bhref="(?:link::|javascript:)[^"]*"([^>]*)>(.*?)</a>',
+        r'<span\1\2>\3</span>',
+        html,
+        flags=re.S | re.I,
+    )
+    # Same-page #anchors — just drop the href attribute, keep the <a> tag
+    html = re.sub(
+        r'\bhref="#[^"]*"',
+        '',
+        html,
+    )
+    return html

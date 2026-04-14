@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import config
 from gdb_reader import GdbReader
-from render import xml_to_html
+from render import xml_to_html, strip_pdf_hrefs
 from pdf_builder import html_to_pdf
 
 
@@ -48,6 +48,7 @@ def main():
             continue
 
         html = xml_to_html(xml, xsl_path, data_parent)
+        html = strip_pdf_hrefs(html)
         ok = html_to_pdf(html, out_pdf, base_url=base_url)
         print(f'{"OK" if ok else "FAIL"}\t{out_pdf}\t{db_record_path}', flush=True)
 
