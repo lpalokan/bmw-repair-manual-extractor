@@ -32,6 +32,7 @@ from model_registry import list_models, get_model_info
 from pdf_builder import build_final_pdf, make_title_page_html, html_to_pdf
 from render import extract_ref_links
 from html_exporter import export_model_html
+from okf_exporter import export_model_okf
 
 # Batch size for subprocess rendering: keeps each worker process small enough
 # to avoid the WeasyPrint/Pango/fontconfig crash on macOS ARM64.
@@ -46,13 +47,21 @@ def cli():
     Quick start:
       python main.py decode-db            # one-time: decode the database
       python main.py models               # list all available models
-      python main.py extract --model 0458            # short PDF (~125 MB)
-      python main.py extract --model 0458 --full     # full PDF with live links
-      python main.py export-html --model 0458        # self-contained HTML
-      python main.py serve                           # local web UI
+      python main.py export --model 0458 --format pdf    # merged PDF (default)
+      python main.py export --model 0458 --format html   # self-contained HTML
+      python main.py export --model 0458 --format okf    # Open Knowledge Format
+      python main.py extract --model 0458 --full         # full PDF with live links
+      python main.py serve                               # local web UI
 
     \b
-    PDF modes (extract command):
+    Output formats (export command):
+      pdf   Merged PDF with TOC + bookmarks (same as the extract command).
+      html  Self-contained HTML directory (index.html + procedures/ + images/).
+      okf   Open Knowledge Format: a portable directory of cross-linked Markdown
+            files with YAML frontmatter + images, for feeding to an LLM/agent.
+
+    \b
+    PDF modes (extract command / --format pdf):
       (default)  Renders main procedures + tightening torques, special tools,
                  lubricants etc. Cross-procedure links are stripped.
       --full     Also renders all cross-referenced sub-steps (removal,
@@ -341,6 +350,80 @@ def cmd_export_html(model, out, subdir, limit):
 
     click.echo(f'\nDone. {total} procedures → {out}')
     click.echo(f'Open: file://{os.path.join(out, "index.html")}')
+
+
+def _run_okf_export(model, out, subdir, limit):
+    """Export a model as an Open Knowledge Format bundle (Markdown + frontmatter)."""
+    _ensure_db()
+
+    model_info = get_model_info(config.DECODED_DB, model)
+    click.echo(f'Model {model}: {model_info.name}')
+
+    reader = GdbReader(config.DECODED_DB)
+    paths = reader.list_paths(model, subdir)
+    reader.close()
+    if limit:
+        paths = paths[:limit]
+    click.echo(f'Found {len(paths)} records in {subdir}')
+
+    if out is None:
+        safe_name = model_info.name.replace(' ', '_').replace('/', '-')
+        out = os.path.join(config.OUTPUT_DIR, f'BMW_{safe_name}_{model}_OKF')
+    os.makedirs(out, exist_ok=True)
+
+    data_parent = os.path.dirname(config.DATA_DIR)
+
+    def _progress(current, total_, slug):
+        click.echo(f'  [{current}/{total_}] {slug}')
+
+    export_model_okf(
+        model_info=model_info,
+        paths=paths,
+        out_dir=out,
+        xsl_path=config.XSL_PATH,
+        data_parent=data_parent,
+        on_progress=_progress,
+    )
+
+    click.echo(f'\nDone. {len(paths)} procedures → {out}')
+    click.echo(f'Entry point: {os.path.join(out, "index.md")}')
+
+
+@cli.command('export')
+@click.option('--model', required=True, help='4-digit model code (e.g. 0458). Run "models" to see all codes.')
+@click.option('--format', 'fmt', type=click.Choice(['pdf', 'html', 'okf']),
+              default='pdf', show_default=True,
+              help='Output format: pdf (merged PDF), html (self-contained site), '
+                   'okf (Open Knowledge Format Markdown bundle for LLMs/agents).')
+@click.option('--out', default=None, help='Output directory/file (default: under output/).')
+@click.option('--subdir', default=config.DEFAULT_SUBDIR, show_default=True,
+              help='DB subdirectory to render (POS = main repair steps)')
+@click.option('--limit', default=0, help='Max procedures to export (0 = all; use small values for testing)')
+@click.option('--full', 'full_pdf', is_flag=True, default=False,
+              help='PDF only: also render cross-referenced docs and wire live GoTo links. '
+                   'Ignored for html/okf (those always include cross-referenced docs).')
+@click.pass_context
+def cmd_export(ctx, model, fmt, out, subdir, limit, full_pdf):
+    """Export a model's repair procedures in the chosen format.
+
+    \b
+    Examples:
+      python main.py export --model 0458 --format pdf
+      python main.py export --model 0458 --format html
+      python main.py export --model 0458 --format okf
+      python main.py export --model 0458 --format okf --limit 5   # quick test
+
+    The okf format produces a portable directory of cross-linked Markdown files
+    with YAML frontmatter and copied images — designed to be handed to an LLM or
+    agent (Claude Code, Codex, …) as a navigable knowledge base for inference.
+    """
+    if fmt == 'pdf':
+        ctx.invoke(cmd_extract, model=model, out=out, subdir=subdir,
+                   limit=limit, full_pdf=full_pdf)
+    elif fmt == 'html':
+        ctx.invoke(cmd_export_html, model=model, out=out, subdir=subdir, limit=limit)
+    else:  # okf
+        _run_okf_export(model, out, subdir, limit)
 
 
 @cli.command('serve')

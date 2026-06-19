@@ -3,3 +3,4 @@ weasyprint>=60.0
 pypdf>=4.0
 click>=8.0
 flask>=3.0
+markdownify>=0.13
