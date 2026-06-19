@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# The source/ modules import each other by bare name (e.g. `import config`,
+# `from html_exporter import _proc_slug`), relying on source/ being on sys.path.
+# pythonpath makes that work when running tests from the repo root.
+pythonpath = ["source"]
+testpaths = ["tests"]

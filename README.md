@@ -2,7 +2,7 @@
 
 Extracts repair procedures from the BMW KSD (2013) Windows-only CD application and produces a printable PDF or a browsable web interface — on macOS, Linux, or any modern system.
 
-The original application stores all content in a proprietary binary database (`XML_01.Dat`, ~405 MB). This tool decodes the database, extracts repair procedures for any model, renders them via the original XSLT stylesheet, and outputs a merged PDF with a cover page and table of contents, a self-contained HTML directory, or an on-demand local web server.
+The original application stores all content in a proprietary binary database (`XML_01.Dat`, ~405 MB). This tool decodes the database, extracts repair procedures for any model, renders them via the original XSLT stylesheet, and outputs a merged PDF with a cover page and table of contents, a self-contained HTML directory, an [Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing) (OKF) bundle for feeding to an LLM/agent, or an on-demand local web server.
 
 ## Background
 
@@ -80,6 +80,16 @@ Code     Model Name                               Image
 
 **Step 3 — pick an output format:**
 
+Use the unified `export` command with `--format {pdf,html,okf}`:
+
+```bash
+python source/main.py export --model 0458 --format pdf    # merged PDF (default)
+python source/main.py export --model 0458 --format html   # self-contained HTML
+python source/main.py export --model 0458 --format okf    # Open Knowledge Format
+```
+
+The format-specific commands below still work and are equivalent.
+
 **PDF** — a single merged document with table of contents:
 ```bash
 python source/main.py extract --model 0458
@@ -98,6 +108,26 @@ python source/main.py export-html --model 0458 --out ~/Desktop/HP2_Sport/
 ```
 
 Produces `index.html` + `procedures/` + `images/` — open in any browser without the original data directory. The index groups each main procedure with its associated sub-documents (tightening torques, special tools, lubricants, etc.) as pill links, matching the layout of the web UI.
+
+**OKF** — an [Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing) bundle for LLMs/agents:
+```bash
+python source/main.py export --model 0458 --format okf
+python source/main.py export --model 0458 --format okf --limit 5   # quick test
+```
+
+Produces a portable directory of cross-linked Markdown files with YAML frontmatter — designed to be handed to an LLM or agent (Claude Code, Codex, …) as a navigable knowledge base for inference. Each repair document becomes one OKF "concept" file (frontmatter `type`/`title`/`description`/`resource`/`tags`/`timestamp` + a clean Markdown body). Cross-references render as relative `[…](./SLUG.md)` links and diagrams as `![](../images/…)`; the rendered HTML's layout tables are flattened while real data tables (tightening torques, technical data) are kept as GFM tables, and UI-chrome icons/scripts are stripped. Like the HTML export, it follows every `link::` cross-reference so all referenced sub-documents are included.
+
+```
+output/BMW_HP2_Sport_0458_OKF/
+  index.md              ← model overview + grouped procedure links (entry point)
+  log.md                ← generation provenance (reserved OKF filename)
+  images/               ← all referenced procedure diagrams
+  procedures/
+    index.md            ← full concept list (progressive disclosure)
+    <SLUG>.md           ← one concept per document (POS + sub-docs + linked docs)
+```
+
+Point an agent at `index.md` to start navigating.
 
 **Web UI** — browse all models and render procedures on demand:
 ```bash
@@ -134,7 +164,7 @@ All three output formats (PDF table of contents, HTML export index, web UI model
 
 ```
 source/
-  main.py            # CLI entry point: decode-db, models, extract, export-html, serve, list-paths
+  main.py            # CLI entry point: decode-db, models, export, extract, export-html, serve, list-paths
   config.py          # paths to input data, decoded DB, output directory
   gdb_reader.py      # GRIPS GDB decoder: XOR + delta encoding + zlib decompression
   pak_reader.py      # PAK/+PAK format decompressor for DYN-W-PLAN index files
@@ -143,11 +173,13 @@ source/
   pdf_builder.py     # HTML → PDF (WeasyPrint) + TOC + merge (pypdf) + bookmarks + links
   render_worker.py   # subprocess worker for crash-safe batch rendering
   html_exporter.py   # exports procedures as a self-contained HTML directory
+  okf_exporter.py    # exports procedures as an Open Knowledge Format Markdown bundle
   server.py          # Flask web server with on-demand procedure rendering
   templates/
     home.html        # model grid home page
     model.html       # procedure list page
   requirements.txt
+tests/               # pytest suite (run: pip install -r requirements-dev.txt && pytest)
 ```
 
 ## Technical Notes
